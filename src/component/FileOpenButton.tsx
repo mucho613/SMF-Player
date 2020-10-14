@@ -4,27 +4,13 @@ interface Props {
   onFileOpen: (file: File) => void;
 }
 
-class FileOpenButton extends React.Component<Props, {}> {
-  file: any;
-  handleFileOpen: (file: File) => void;
-
-  constructor(props: Props) {
-    super(props);
-    this.file = React.createRef();
-    this.handleFileOpen = props.onFileOpen;
-  }
-
-  componentDidMount() {
-    this.file.current.addEventListener('change', (e: any) => {
-      var target = e.target;
-      var files = target.files;
-      this.handleFileOpen(files[0]);
-    }, false);
-  }
-
-  render() {
-    return <input type="file" ref={this.file}></input>
-  }
+function FileOpenButton(props: Props) {
+  return (
+    <input onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
+      const files = event.target.files;
+      if(files?.length === 1) props.onFileOpen(files[0]);
+    }} type="file"></input>
+  )
 }
 
 export default FileOpenButton;
