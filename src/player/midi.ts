@@ -1,29 +1,71 @@
 import { readAsArrayBuffer } from "./common";
 
-interface MIDIEvent {
+type MIDIEvent = ChannelMessage | SystemExclusiveMessage | MetaEvent | null;
+type MetaEvent = EndOfTrack | SetTempo | PortSelect;
+
+interface SequenceEvent {
   tick: number;
+  midiEvent: TransmittableMessage | MetaEvent;
+}
+
+interface TransmittableMessage {
   outputPort: number;
-  type: MIDIEventType;
-  content: MIDIMessage | TempoChange;
+  midiMessage: ChannelMessage | SystemExclusiveMessage;
 }
 
-interface MIDIMessage {
-  byteArray: Uint8Array | number[];
+interface ChannelMessage {
+  content: Uint8Array | number[];
 }
 
-interface TempoChange {
+interface SystemExclusiveMessage {
+  content: Uint8Array | number[];
+}
+
+interface EndOfTrack {
+  metaEventType: MetaEventType.EndOfTrack;
+}
+
+interface SetTempo {
+  metaEventType: MetaEventType.SetTempo;
   milliSecondsPerBeat: number;
 }
 
-enum MIDIEventType {
-  MIDIMessage = 0,
-  TempoChange = 1
+interface PortSelect {
+  metaEventType: MetaEventType.PortSelect;
+  portNumber: number;
 }
 
-export const handleFileOpen = async (file: File): Promise<[MIDIEvent[], number]> => {
-  const buffer = await readAsArrayBuffer(file);
+enum MIDIEventType {
+  ChannelMessage = 0x00,
+  SystemExclusiveMessageTypeA = 0xF0,
+  SystemExclusiveMessageTypeB = 0xF7,
+  MetaEvent = 0xFF,
+}
 
+enum MetaEventType {
+  SequenceNumber = 0x00,
+  Text = 0x01,
+  CopyrightNotice = 0x02,
+  SequenceOrTrackName = 0x03,
+  InstrumentName = 0x04,
+  Lylic = 0x05,
+  Marker = 0x06,
+  QueuePoint = 0x07,
+  ProgramName = 0x08,
+  DeviceName = 0x09,
+  MIDIChannelPrefix = 0x20,
+  EndOfTrack = 0x2F,
+  SetTempo = 0x51,
+  SMPTEOffset = 0x54,
+  TimeSignature = 0x58,
+  KeySignature = 0x59,
+  PortSelect = 0x21,
+}
+
+export const handleFileOpen = async (file: File): Promise<[SequenceEvent[], number]> => {
+  const buffer = await readAsArrayBuffer(file);
   if(!(buffer instanceof ArrayBuffer)) throw new Error("読み込めないファイルです。");
+
   const dataView = new DataView(buffer);
   smfValidate(dataView);
 
@@ -40,14 +82,203 @@ export const handleFileOpen = async (file: File): Promise<[MIDIEvent[], number]>
     trackTopPosition = trackTopPosition + 8 + trackLength;
   }
 
-  const trackEventArray = tracks.map(track => trackParse(track));
+  const trackEvents = tracks.map(track => parseTrack(track));
 
   // トラックごとのイベントを統合する
-  const eventArray = mergeTrack(trackEventArray);
+  const mergedEvents = mergeTrackEvents(...trackEvents);
 
   return new Promise((resolve, reject) => {
-    return resolve([eventArray, timeBase]);
+    return resolve([mergedEvents, timeBase]);
   });
+};
+
+const parseTrack = (trackBuffer: ArrayBuffer) => {
+  const byteArray = new Uint8Array(trackBuffer);
+  let totalDeltaTime: number = 0;
+
+  const trackEventArray: SequenceEvent[] = [];
+  let previousStatusByte = 0;
+  let bufferPointer = 0;
+  let portNumber = 0;
+
+  while (bufferPointer < trackBuffer.byteLength) {
+    const deltaTime = variableLengthQuantityToInt(byteArray.subarray(bufferPointer));
+    const deltaTimeByteLength = variableLengthQuantityByteLength(byteArray.subarray(bufferPointer));
+
+    totalDeltaTime += deltaTime;
+    bufferPointer += deltaTimeByteLength;
+
+    try {
+      const [translatedEvent, eventLength] = translateEvent(byteArray, bufferPointer, previousStatusByte);
+
+      if(translatedEvent && "content" in translatedEvent && translatedEvent.content[0] !== 0xF0 && translatedEvent.content[0] !== 0xF7) {
+        previousStatusByte = translatedEvent.content[0];
+      }
+
+      // TransmittableMessage
+      if(translatedEvent && "content" in translatedEvent) {
+        trackEventArray.push({
+          tick: totalDeltaTime,
+          midiEvent: {
+            outputPort: portNumber,
+            midiMessage: translatedEvent
+          }
+        });
+      }
+      else if(translatedEvent !== null) {
+        trackEventArray.push({
+          tick: totalDeltaTime,
+          midiEvent: translatedEvent
+        });
+      }
+
+      if(translatedEvent && "portNumber" in translatedEvent) {
+        portNumber = translatedEvent.portNumber;
+      }
+
+      bufferPointer += eventLength;
+    } catch(e) {
+      console.log(e);
+      throw new Error("Track parse error. Track buffer pointer: " + bufferPointer);
+    }
+  }
+
+  return trackEventArray;
+};
+
+const mergeTrackEvents = (...tracks: SequenceEvent[][]) => {
+  const eventArray = [];
+  const reversedTracks = tracks.map(track => track.reverse());
+  while (reversedTracks.some(track => track.length > 0)) {
+    const minimumTickTrack = reversedTracks
+      .filter(track => track.length > 0)
+      .reduce((a, b) => a[a.length - 1].tick < b[b.length - 1].tick ? a : b);
+    const targetEvent = minimumTickTrack.pop();
+    if (targetEvent) eventArray.push(targetEvent);
+  }
+  return eventArray;
+};
+
+const translateEvent = (byteArray: Uint8Array, bufferPointer: number, previousStatusByte: number): [MIDIEvent, number] => {
+  if (byteArray[bufferPointer] === MIDIEventType.MetaEvent) {
+    const metaEventLength = variableLengthQuantityToInt(byteArray.subarray(bufferPointer + 2));
+    const metaEventLengthByteLength = variableLengthQuantityByteLength(byteArray.subarray(bufferPointer + 2));
+    const bufferPointerAdvance = metaEventLengthByteLength + metaEventLength + 2;
+
+    switch (byteArray[bufferPointer + 1]) {
+      case 0x00: // Sequence Number
+      case 0x01: // Text
+      case 0x02: // Copyright Notice
+      case 0x03: // Sequence / Track Name
+      case 0x04: // Instrument Name
+      case 0x05: // Lylic
+      case 0x06: // Marker
+      case 0x07: // Queue Point
+      case 0x08: // Program Name
+      case 0x09: // Device Name
+      case 0x20: // MIDI Channel Prefix
+      case 0x2F: // End of Track
+      case 0x54: // SMPTE Offset
+      case 0x58: // Time Signature
+      case 0x59: // Key Signature
+        return [null, bufferPointerAdvance];
+      case 0x51: // Set Tempo
+      const milliSecondsPerBeat = (
+        (byteArray[bufferPointer + 3] << 16) |
+        (byteArray[bufferPointer + 4] << 8) |
+        byteArray[bufferPointer + 5]) / 1000;
+        return [{
+          metaEventType: MetaEventType.SetTempo,
+          milliSecondsPerBeat: milliSecondsPerBeat
+        }, bufferPointerAdvance];
+      case 0x21: // Port Select
+        return [{
+          metaEventType: MetaEventType.PortSelect,
+          portNumber: byteArray[bufferPointer + 3]
+        }, bufferPointerAdvance];
+      default:
+        throw new Error("Unknown Meta Event");
+    }
+  }
+
+  else if (byteArray[bufferPointer] === MIDIEventType.SystemExclusiveMessageTypeA) {
+    const eventLength = variableLengthQuantityToInt(byteArray.subarray(bufferPointer + 1));
+    const eventLengthByteLength = variableLengthQuantityByteLength(byteArray.subarray(bufferPointer + 1));
+    const numberArray = Array.prototype.slice.call(
+      byteArray.subarray(bufferPointer + eventLengthByteLength + 2, bufferPointer + eventLengthByteLength + eventLength)
+    );
+    return [{
+      content: [0xF0, byteArray[bufferPointer + eventLengthByteLength + 1]].concat(numberArray, [0xF7])
+    }, eventLengthByteLength + eventLength + 1];
+  }
+
+  else { // Channel Message
+    const isRunningStatus = byteArray[bufferPointer] & 0x80;
+
+    const statusByte = isRunningStatus ?
+      byteArray[bufferPointer] :
+      previousStatusByte;
+
+    const dataBytesHeadPointer = isRunningStatus ?
+      bufferPointer + 1 :
+      bufferPointer;
+
+    switch (statusByte & 0xF0) {
+      case 0x80: // Note Off
+      case 0x90: // Note On
+      case 0xA0: // Polyphonic Key Pressure
+      case 0xB0: // Control Change
+      case 0xE0: // Pitch Bend
+        if(byteArray[dataBytesHeadPointer] === undefined || byteArray[dataBytesHeadPointer + 1] === undefined)
+          throw new Error("Buffer overrun!");
+        return [{
+          content: [statusByte, byteArray[dataBytesHeadPointer], byteArray[dataBytesHeadPointer + 1]]
+        }, isRunningStatus ? 3 : 2];
+      case 0xC0: // Program Change
+      case 0xD0: // Channel Pressure
+        if(byteArray[dataBytesHeadPointer] === undefined)
+          throw new Error("Buffer overrun!" + bufferPointer);
+        return [{
+          content: [statusByte, byteArray[dataBytesHeadPointer]]
+        }, isRunningStatus ? 2 : 1];
+      default:
+        throw new Error('Unknown Channel Message: ' + byteArray.slice(bufferPointer, bufferPointer + 3));
+    }
+  }
+};
+
+const variableLengthQuantityByteLength = (byteArray: Uint8Array): number => {
+  if (byteArray[0] & 0x80) {
+    if (byteArray[1] & 0x80) {
+      if (byteArray[2] & 0x80) return 4;
+      else return 3;
+    }
+    else return 2;
+  }
+  else return 1;
+};
+
+const variableLengthQuantityToInt = (byteArray: Uint8Array): number => {
+  const byteLength = variableLengthQuantityByteLength(byteArray);
+  if(byteLength === 1) {
+    return byteArray[0];
+  }
+  else if(byteLength === 2) {
+    return ((byteArray[0] & 0x7F) << 7 ) |
+            (byteArray[1] & 0x7F);
+  }
+  else if(byteLength === 3) {
+    return ((byteArray[0] & 0x7F) << 14) |
+           ((byteArray[1] & 0x7F) << 7 ) |
+            (byteArray[2] & 0x7F);
+  }
+  else if(byteLength === 4) {
+    return ((byteArray[0] & 0x7F) << 21) |
+           ((byteArray[1] & 0x7F) << 14) |
+           ((byteArray[2] & 0x7F) << 7 ) |
+            (byteArray[3] & 0x7F);
+  }
+  else throw new Error("可変長数値の計算に失敗しました。");
 };
 
 const smfValidate = (dataView: DataView) => {
@@ -69,159 +300,3 @@ const smfTrackValidate = (dataView: DataView, trackTopPosition: number) => {
   if (mtrkSignature !== 0x4D54726B)
     throw new Error("MTrk シグネチャが不正なため、読み込むことができません。");
 };
-
-const variableLengthQuantityToInt = (byteArray: Uint8Array, start: number): { quantity: number, byteLength: number } => {
-  let quantity = 0, byteLength: number = 0;
-
-  for(let i=0; i<4; i++) {
-    // Delta time(可変長数値表現)
-    if(!(byteArray[start + i] & 0b10000000)) {
-      for(let j=0; j<i + 1; j++) {
-        quantity |= ((0b01111111 & byteArray[start + i - j]) << (7 * j));
-      }
-      byteLength = i + 1;
-      break;
-    }
-  }
-
-  return {
-    quantity: quantity,
-    byteLength: byteLength
-  };
-};
-
-const trackParse = (track: ArrayBuffer) => {
-  const byteArray = new Uint8Array(track);
-  let totalDeltaTime: number = 0;
-
-  const trackEventArray: MIDIEvent[] = [];
-  let previousStatusByte = 0;
-
-  let outputPort = 0;
-
-  for (let i = 0; i < track.byteLength; i++) {
-    const deltaTime = variableLengthQuantityToInt(byteArray, i);
-
-    i += deltaTime.byteLength;
-    totalDeltaTime += deltaTime.quantity;
-
-    if (byteArray[i] === 0xFF) {
-      // メタイベント種類の判別
-      switch (byteArray[i + 1]) {
-        case 0x00: // Sequence Number
-        case 0x01: // Text
-        case 0x02: // Copyright Notice
-        case 0x03: // Sequence / Track Name
-        case 0x04: // Instrument Name
-        case 0x05: // Lylic
-        case 0x06: // Marker
-        case 0x07: // Queue Point
-        case 0x08: // Program Name
-        case 0x09: // Device Name
-        case 0x20: // MIDI Channel Prefix
-        case 0x2F: // End of Track
-          break;
-        case 0x51: // Set Tempo
-          const milliSecondsPerBeat = ((byteArray[i + 3] << 16) | (byteArray[i + 4] << 8) | byteArray[i + 5]) / 1000;
-          trackEventArray.push({
-            tick: totalDeltaTime,
-            outputPort: 0,
-            type: MIDIEventType.TempoChange,
-            content: { milliSecondsPerBeat }
-          });
-          break;
-        case 0x54: // SMPTE Offset
-        case 0x58: // Time Signature
-        case 0x59: // Key Signature
-          break;
-        case 0x21: // Port Select
-          outputPort = byteArray[i + 3];
-          break;
-        default:
-          throw new Error("Unknown Meta Event");
-      }
-
-      const metaEventLength = variableLengthQuantityToInt(byteArray, i + 2);
-      i += metaEventLength.byteLength + metaEventLength.quantity + 1;
-    }
-
-    else if (byteArray[i] === 0xF0) {
-      const eventLength = variableLengthQuantityToInt(byteArray, i + 1);
-      const numberArray = Array.prototype.slice.call(
-        byteArray.subarray(i + eventLength.byteLength + 2, i + eventLength.byteLength + eventLength.quantity)
-      );
-      trackEventArray.push({
-        tick: totalDeltaTime,
-        outputPort: outputPort,
-        type: MIDIEventType.MIDIMessage,
-        content: { byteArray: [0xF0, byteArray[i + eventLength.byteLength + 1]].concat(numberArray, [0xF7]) }
-      });
-
-      i += eventLength.byteLength + eventLength.quantity;
-    }
-    // TODO: 0xF7 ステータスのやつを書く
-    else {
-      if (byteArray[i] & 0b10000000)
-        previousStatusByte = byteArray[i]; // Channel Message
-      else
-        i--;
-
-      let dataByteLength = 0;
-
-      // チャンネル情報を AND で捨てて判定する
-      switch (previousStatusByte & 0xF0) {
-        case 0x80: // Note Off
-        case 0x90: // Note On
-        case 0xA0: // Polyphonic Key Pressure
-        case 0xB0: // Control Change
-        case 0xE0: // Pitch Bend
-          dataByteLength = 2;
-          break;
-        case 0xC0: // Program Change
-        case 0xD0: // Channel Pressure
-          dataByteLength = 1;
-          break;
-        default:
-          throw new Error('Unknown Channel Message');
-      }
-      if (dataByteLength === 1) {
-        trackEventArray.push({
-          tick: totalDeltaTime,
-          outputPort: outputPort,
-          type: MIDIEventType.MIDIMessage,
-          content: { byteArray: [previousStatusByte, byteArray[i + 1]] }
-        });
-      }
-      else if (dataByteLength === 2) {
-        trackEventArray.push({
-          tick: totalDeltaTime,
-          outputPort: outputPort,
-          type: MIDIEventType.MIDIMessage,
-          content: { byteArray: [previousStatusByte, byteArray[i + 1], byteArray[i + 2]] }
-        });
-      }
-
-      i += dataByteLength;
-    }
-  }
-
-  return trackEventArray;
-};
-
-function mergeTrack(trackEventArray: MIDIEvent[][]) {
-  const eventArray = [];
-  while (trackEventArray.some(track => track.length > 0)) {
-    let minimumTick = Number.MAX_SAFE_INTEGER;
-    let targetTrack: MIDIEvent[] | null = [];
-    for (let track of trackEventArray) {
-      if (minimumTick > track[0]?.tick) {
-        minimumTick = track[0].tick;
-        targetTrack = track;
-      }
-    }
-    const targetEvent = targetTrack.shift();
-    if (targetEvent) eventArray.push(targetEvent);
-  }
-  return eventArray;
-}
-

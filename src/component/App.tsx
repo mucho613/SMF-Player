@@ -33,13 +33,13 @@ function App() {
               startTime +
               lastTempoChangedTime +
               (event.tick - lastTempoChangedTick) / timebase * milliSecondsPerBeat; // 現在利用中のテンポが適用されてから現在までの経過時間(ms)
-            if("byteArray" in event.content) {
-              midiOutputPortMap.get(event.outputPort)?.send(event.content.byteArray, targetTime);
+            if(event.midiEvent && "outputPort" in event.midiEvent && "midiMessage" in event.midiEvent) {
+              midiOutputPortMap.get(event.midiEvent.outputPort)?.send(event.midiEvent.midiMessage.content, targetTime);
             }
-            if("milliSecondsPerBeat" in event.content) {
+            if(event.midiEvent && "milliSecondsPerBeat" in event.midiEvent) {
               lastTempoChangedTime = lastTempoChangedTime + (event.tick - lastTempoChangedTick) / timebase * milliSecondsPerBeat;
               lastTempoChangedTick = event.tick;
-              milliSecondsPerBeat = event.content.milliSecondsPerBeat;
+              milliSecondsPerBeat = event.midiEvent.milliSecondsPerBeat;
             }
           }
 
